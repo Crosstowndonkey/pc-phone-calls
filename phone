@@ -1,0 +1,659 @@
+#!/usr/bin/env python3
+"""Make, answer and end calls on the Bluetooth-connected phone from the PC.
+
+  phone dial 0412345678   dial straight away
+  phone dial mum          dial a name from ~/.config/phone-contacts.txt
+  phone                   open the Phone window (keypad, Call, Hang up)
+  phone ask [tel:...]     open the window with the number filled in (used for links)
+  phone watch             start hidden and wait for calls (used at login)
+  phone answer            answer the ringing call
+  phone hangup            end all calls
+  phone tones 1           press keys during a call (phone menus)
+  phone status            show the connected phone and any calls
+
+It talks to PipeWire's telephony service, which controls the phone over the
+Bluetooth hands-free link. The call itself is made by the phone.
+
+The Phone window stays open during the call: Hang up ends it, and the keypad
+(or the number keys) sends key tones, for "press 1 for..." phone menus.
+The Call volume slider sets how loud the other person is.
+Closing the window only hides it: it keeps running, and pops back up showing
+who is calling when the phone rings. The Quit button really closes it.
+While it runs there is a Phone icon in the system tray; click it to show or
+hide the window.
+"""
+import math
+import os
+import re
+import shutil
+import socket
+import subprocess
+import sys
+import struct
+import urllib.parse
+import wave
+
+import dbus
+import dbus.service
+
+SERVICE = "org.pipewire.Telephony"
+ROOT = "/org/pipewire/Telephony"
+AG_IFACE = "org.pipewire.Telephony.AudioGateway1"
+CALL_IFACE = "org.pipewire.Telephony.Call1"
+OBJECT_MANAGER = "org.freedesktop.DBus.ObjectManager"
+PROPERTIES = "org.freedesktop.DBus.Properties"
+TRAY_IFACE = "org.kde.StatusNotifierItem"   # the system tray's way of talking to icons
+CONTACTS_FILE = os.path.expanduser("~/.config/phone-contacts.txt")
+RINGING = ("incoming", "waiting")   # call states that mean "someone is calling you"
+TONE_KEYS = "123456789*0#"          # the keypad, in the order it is laid out
+# A running Phone window listens here, so opening Phone again shows that window
+# instead of starting a second one.
+SOCKET_PATH = os.path.join(os.environ.get("XDG_RUNTIME_DIR", "/tmp"), "phone-window.sock")
+
+
+def notify(text: str, icon: str = "call-start") -> None:
+    """Print a message and also show it as a desktop notification."""
+    print(text)
+    subprocess.run(["notify-send", "-a", "Phone", "-i", icon, "Phone", text],
+                   check=False)
+
+
+TONE_FOLDER = os.environ.get("XDG_RUNTIME_DIR", "/tmp")
+# The classic phone keypad sound: every key plays two notes at once, one for
+# its row and one for its column (the standard "touch tone" pitches, in Hz).
+ROW_PITCHES = (697.0, 770.0, 852.0, 941.0)
+COLUMN_PITCHES = (1209.0, 1336.0, 1477.0)
+beeps_playing: list[subprocess.Popen] = []
+
+
+def tone_file(key: str) -> str:
+    """Where the sound file for a keypad key is kept."""
+    return os.path.join(TONE_FOLDER, f"phone-key-{TONE_KEYS.index(key)}.wav")
+
+
+def make_tone_file(key: str) -> None:
+    """Write a key's two-note tone as a sound file (made from maths, no recording)."""
+    position = TONE_KEYS.index(key)
+    pitches = (ROW_PITCHES[position // 3], COLUMN_PITCHES[position % 3])
+    rate, seconds, loudness = 44100, 0.13, 0.15
+    count = int(rate * seconds)
+    fade = int(rate * 0.01)   # fade in and out, so it doesn't click
+    samples = []
+    for index in range(count):
+        edge = min(1.0, index / fade, (count - 1 - index) / fade)
+        value = sum(math.sin(2 * math.pi * pitch * index / rate) for pitch in pitches)
+        samples.append(struct.pack("<h", int(value * loudness * edge * 32767)))
+    with wave.open(tone_file(key), "wb") as sound:
+        sound.setnchannels(1)
+        sound.setsampwidth(2)
+        sound.setframerate(rate)
+        sound.writeframes(b"".join(samples))
+
+
+def beep(key: str) -> None:
+    """Play a keypad key's tone without waiting for it to finish."""
+    player = shutil.which("pw-play") or shutil.which("paplay")
+    if not player or key not in TONE_KEYS:
+        return
+    try:
+        if not os.path.exists(tone_file(key)):
+            make_tone_file(key)
+        beeps_playing[:] = [p for p in beeps_playing if p.poll() is None]   # tidy finished ones
+        beeps_playing.append(subprocess.Popen([player, tone_file(key)], stdout=subprocess.DEVNULL,
+                                              stderr=subprocess.DEVNULL))
+    except OSError:
+        pass   # a missing beep must never get in the way of a call
+
+
+class PhoneError(Exception):
+    """Something went wrong that the user should be told about."""
+
+
+def fail(text: str) -> None:
+    notify(text)
+    sys.exit(1)
+
+
+def managed_objects(bus: dbus.Bus, path: str) -> dict:
+    manager = dbus.Interface(bus.get_object(SERVICE, path), OBJECT_MANAGER)
+    return manager.GetManagedObjects()
+
+
+def connected_phone(bus: dbus.Bus) -> str:
+    """Return the D-Bus path of the connected phone, or "" if there is none."""
+    try:
+        for path, interfaces in managed_objects(bus, ROOT).items():
+            if AG_IFACE in interfaces:
+                return str(path)
+    except dbus.DBusException:
+        pass
+    return ""
+
+
+def find_phone(bus: dbus.Bus) -> str:
+    """Return the D-Bus path of the connected phone, or raise PhoneError."""
+    phone = connected_phone(bus)
+    if not phone:
+        raise PhoneError("No phone connected. Connect your phone over Bluetooth first.")
+    return phone
+
+
+def calls(bus: dbus.Bus, phone: str) -> list[tuple[str, dict]]:
+    """Every current call on the phone as (path, properties)."""
+    found = []
+    for path, interfaces in managed_objects(bus, phone).items():
+        if CALL_IFACE in interfaces:
+            found.append((str(path), interfaces[CALL_IFACE]))
+    return found
+
+
+def load_contacts() -> dict[str, str]:
+    """Read 'name = number' lines from the contacts file (if there is one)."""
+    contacts: dict[str, str] = {}
+    if not os.path.exists(CONTACTS_FILE):
+        return contacts
+    with open(CONTACTS_FILE, encoding="utf-8") as handle:
+        for line in handle:
+            line = line.split("#")[0] if line.lstrip().startswith("#") else line
+            if "=" in line:
+                name, number = line.split("=", 1)
+                contacts[name.strip().lower()] = number.strip()
+    return contacts
+
+
+def caller_text(props: dict) -> str:
+    """Who a call is with: the contact's name if the number is in the contacts file."""
+    number = str(props.get("LineIdentification") or "")
+    if not number:
+        return str(props.get("Name") or "") or "unknown number"
+    digits = re.sub(r"\D", "", number)
+    for name, contact_number in load_contacts().items():
+        contact_digits = re.sub(r"\D", "", contact_number)
+        # Compare the last 8 digits, so 0412 345 678 matches +61 412 345 678.
+        if len(digits) >= 8 and len(contact_digits) >= 8 and digits[-8:] == contact_digits[-8:]:
+            return f"{name.title()} ({number})"
+    return number
+
+
+def clean_number(text: str) -> str:
+    """Turn what was typed (a number, a tel: link or a contact name) into digits."""
+    text = text.strip()
+    if text.lower().startswith("tel:"):
+        text = urllib.parse.unquote(text[4:]).split(";")[0]
+    text = load_contacts().get(text.lower(), text)
+    number = re.sub(r"[\s\-().]", "", text)
+    if not re.fullmatch(r"\+?[0-9*#]{2,20}", number):
+        raise PhoneError(f"'{text}' is not a phone number or a name in {CONTACTS_FILE}")
+    return number
+
+
+def dial(bus: dbus.Bus, text: str) -> str:
+    """Dial a number, tel: link or contact name. Returns the number dialled."""
+    number = clean_number(text)
+    phone = find_phone(bus)
+    try:
+        dbus.Interface(bus.get_object(SERVICE, phone), AG_IFACE).Dial(number)
+    except dbus.DBusException as error:
+        raise PhoneError(f"Could not dial {number}: {error.get_dbus_message()}") from error
+    return number
+
+
+def answer(bus: dbus.Bus) -> None:
+    phone = find_phone(bus)
+    ringing = [path for path, props in calls(bus, phone)
+               if str(props.get("State")) in RINGING]
+    if not ringing:
+        raise PhoneError("No call is ringing.")
+    dbus.Interface(bus.get_object(SERVICE, ringing[0]), CALL_IFACE).Answer()
+
+
+def hangup(bus: dbus.Bus) -> None:
+    phone = find_phone(bus)
+    dbus.Interface(bus.get_object(SERVICE, phone), AG_IFACE).HangupAll()
+
+
+def send_tones(bus: dbus.Bus, tones: str) -> None:
+    """Press keys during a call (for phone menus)."""
+    phone = find_phone(bus)
+    dbus.Interface(bus.get_object(SERVICE, phone), AG_IFACE).SendTones(tones)
+
+
+def call_volume(bus: dbus.Bus, phone: str) -> int:
+    """How loud the other person is, 0 to 15 (the phone's own call volume)."""
+    properties = dbus.Interface(bus.get_object(SERVICE, phone), PROPERTIES)
+    return int(properties.Get(AG_IFACE, "SpeakerVolume"))
+
+
+def set_call_volume(bus: dbus.Bus, volume: int) -> None:
+    phone = find_phone(bus)
+    properties = dbus.Interface(bus.get_object(SERVICE, phone), PROPERTIES)
+    properties.Set(AG_IFACE, "SpeakerVolume", dbus.Byte(max(0, min(15, volume))))
+
+
+class TrayIcon(dbus.service.Object):
+    """The Phone icon in the system tray (next to the clock).
+
+    The tray asks this object what icon and tooltip to show, and tells it when
+    the icon is clicked. Clicking shows or hides the Phone window.
+    """
+
+    def __init__(self, bus: dbus.Bus, on_click) -> None:
+        self.on_click = on_click
+        self.icon = "call-start"
+        self.tip = "Phone"
+        name = f"org.kde.StatusNotifierItem-{os.getpid()}-1"
+        self.bus_name = dbus.service.BusName(name, bus)
+        super().__init__(bus, "/StatusNotifierItem")
+        watcher = bus.get_object("org.kde.StatusNotifierWatcher", "/StatusNotifierWatcher")
+        dbus.Interface(watcher, "org.kde.StatusNotifierWatcher").RegisterStatusNotifierItem(name)
+
+    def update(self, icon: str, tip: str) -> None:
+        """Change the icon and tooltip (only tells the tray if something changed)."""
+        if icon != self.icon:
+            self.icon = icon
+            self.NewIcon()
+        if tip != self.tip:
+            self.tip = tip
+            self.NewToolTip()
+
+    def properties(self) -> dict:
+        tooltip = dbus.Struct((self.icon, dbus.Array([], signature="(iiay)"), "Phone", self.tip),
+                              signature="sa(iiay)ss")
+        return {"Category": "Communications", "Id": "phone", "Title": "Phone",
+                "Status": "Active", "IconName": self.icon, "ToolTip": tooltip,
+                "ItemIsMenu": dbus.Boolean(False), "WindowId": dbus.Int32(0)}
+
+    @dbus.service.method(PROPERTIES, in_signature="ss", out_signature="v")
+    def Get(self, _interface: str, name: str):
+        return self.properties()[name]
+
+    @dbus.service.method(PROPERTIES, in_signature="s", out_signature="a{sv}")
+    def GetAll(self, _interface: str):
+        return self.properties()
+
+    @dbus.service.method(TRAY_IFACE, in_signature="ii")
+    def Activate(self, _x: int, _y: int) -> None:           # left click
+        self.on_click()
+
+    @dbus.service.method(TRAY_IFACE, in_signature="ii")
+    def SecondaryActivate(self, _x: int, _y: int) -> None:  # middle click
+        self.on_click()
+
+    @dbus.service.method(TRAY_IFACE, in_signature="ii")
+    def ContextMenu(self, _x: int, _y: int) -> None:        # right click
+        self.on_click()
+
+    @dbus.service.method(TRAY_IFACE, in_signature="is")
+    def Scroll(self, _delta: int, _direction: str) -> None:
+        pass
+
+    @dbus.service.signal(TRAY_IFACE)
+    def NewIcon(self) -> None:
+        pass
+
+    @dbus.service.signal(TRAY_IFACE)
+    def NewToolTip(self) -> None:
+        pass
+
+
+class PhoneWindow:
+    """The Phone window: a number box, a keypad, Call and Hang up.
+
+    It stays open during the call. Once a second it asks the phone what is
+    going on and updates the status line and the buttons to match.
+    """
+
+    def __init__(self, bus: dbus.Bus, prefill: str = "", hidden: bool = False,
+                 listener: socket.socket | None = None) -> None:
+        import tkinter as tk
+        self.tk = tk
+        self.bus = bus
+        self.listener = listener   # hears from "phone" being opened again
+        self.ringing = False
+        self.busy = False
+        self.was_ringing = False   # to notice the moment a call starts or stops ringing
+        self.caller = ""           # who the ringing call is from
+        self.in_call = False       # a call is connected (key presses send tones)
+        self.call_seconds = 0
+        self.note_ticks = 0        # how many more seconds the note line stays up
+
+        self.root = tk.Tk(className="Phone")
+        self.root.title("Phone")
+        self.root.resizable(False, False)
+        self.root.configure(padx=14, pady=12)
+
+        self.status = tk.Label(self.root, text="", font=("sans", 12, "bold"))
+        self.status.grid(row=0, column=0, columnspan=3, pady=(0, 6))
+
+        self.entry = tk.Entry(self.root, font=("sans", 18), justify="center", width=16)
+        self.entry.grid(row=1, column=0, columnspan=3, sticky="ew", ipady=4)
+        self.entry.insert(0, prefill)
+        self.entry.bind("<Return>", lambda _event: self.call_or_answer())
+        self.entry.bind("<Key>", self.on_typed)
+        self.entry.focus_set()
+
+        self.hint = tk.Label(self.root, text="", font=("sans", 9), fg="#666666")
+        self.hint.grid(row=2, column=0, columnspan=3, pady=(2, 8))
+
+        for index, key in enumerate(TONE_KEYS):
+            tk.Button(self.root, text=key, font=("sans", 16), width=4, height=1,
+                      command=lambda k=key: self.on_keypad(k)
+                      ).grid(row=3 + index // 3, column=index % 3, padx=3, pady=3)
+
+        self.call_button = tk.Button(self.root, text="Call", font=("sans", 13, "bold"),
+                                     bg="#2e9e4f", fg="white", activebackground="#38b85d",
+                                     activeforeground="white", command=self.call_or_answer)
+        self.call_button.grid(row=7, column=0, sticky="ew", padx=3, pady=(10, 0), ipady=4)
+        tk.Button(self.root, text="⌫", font=("sans", 13), command=self.backspace
+                  ).grid(row=7, column=1, sticky="ew", padx=3, pady=(10, 0), ipady=4)
+        self.hangup_button = tk.Button(self.root, text="Hang up", font=("sans", 13, "bold"),
+                                       bg="#c0392b", fg="white", activebackground="#e04a3a",
+                                       activeforeground="white", command=self.hang_up)
+        self.hangup_button.grid(row=7, column=2, sticky="ew", padx=3, pady=(10, 0), ipady=4)
+
+        self.note = tk.Label(self.root, text="", font=("sans", 9), fg="#c0392b",
+                             wraplength=260)
+        self.note.grid(row=8, column=0, columnspan=3, pady=(8, 0))
+
+        # Call volume: how loud the other person is. It is the phone's own call
+        # volume, so the phone's volume buttons move this slider too.
+        tk.Label(self.root, text="Call volume", font=("sans", 9)
+                 ).grid(row=9, column=0, sticky="w", pady=(8, 0))
+        self.volume = tk.Scale(self.root, from_=0, to=15, orient="horizontal",
+                               showvalue=True, font=("sans", 8))
+        self.volume.grid(row=9, column=1, columnspan=2, sticky="ew", pady=(8, 0))
+        self.volume_held = False   # the mouse is dragging it: don't move it under the hand
+        self.volume.bind("<ButtonPress-1>", lambda _event: setattr(self, "volume_held", True))
+        self.volume.bind("<ButtonRelease-1>", self.on_volume)
+        self.volume.bind("<KeyRelease>", self.on_volume)
+
+        tk.Button(self.root, text="Quit (stop watching for calls)", font=("sans", 8),
+                  relief="flat", fg="#666666", command=self.root.destroy
+                  ).grid(row=10, column=0, columnspan=3, pady=(6, 0))
+
+        # The window's X button hides it; it keeps running to catch incoming calls.
+        self.root.protocol("WM_DELETE_WINDOW", self.root.withdraw)
+        if hidden:
+            self.root.withdraw()
+        # The tray icon. If the desktop has no tray (or a piece is missing), carry on without.
+        self.tray = None
+        self.dbus_loop = None
+        try:
+            from gi.repository import GLib
+            self.tray = TrayIcon(bus, self.toggle_window)
+            self.dbus_loop = GLib.MainContext.default()
+            self.pump_dbus()
+        except Exception:   # pylint: disable=broad-except
+            self.tray = None
+        self.refresh()
+        self.check_listener()
+
+    def run(self) -> None:
+        self.root.mainloop()
+
+    # -- what the buttons and keys do --
+
+    def show_note(self, text: str, seconds: int = 6) -> None:
+        self.note.configure(text=text)
+        self.note_ticks = seconds
+
+    def show_window(self) -> None:
+        """Bring the window back (it may be hidden) and put it on top."""
+        self.root.deiconify()
+        self.root.lift()
+        self.root.attributes("-topmost", True)
+        self.root.after(1500, lambda: self.root.attributes("-topmost", False))
+        self.entry.focus_force()
+
+    def toggle_window(self) -> None:
+        """The tray icon was clicked: show the window, or hide it if it is showing."""
+        if self.root.state() == "withdrawn":
+            self.show_window()
+        else:
+            self.root.withdraw()
+
+    def pump_dbus(self) -> None:
+        """Let waiting messages from the tray (clicks, questions) be handled."""
+        while self.dbus_loop.pending():
+            self.dbus_loop.iteration(False)
+        self.root.after(100, self.pump_dbus)
+
+    def check_listener(self) -> None:
+        """Was Phone opened again (app menu, a phone-number link)? Then show this window."""
+        try:
+            while self.listener:
+                connection, _address = self.listener.accept()
+                with connection:
+                    connection.settimeout(0.5)
+                    message = connection.recv(1024).decode("utf-8", "replace")
+                if message.startswith("show"):
+                    number = message[4:].strip()
+                    if number and not self.busy:
+                        self.entry.delete(0, self.tk.END)
+                        self.entry.insert(0, number)
+                    self.show_window()
+        except OSError:
+            pass   # nobody is knocking (the usual case)
+        self.root.after(300, self.check_listener)
+
+    def attempt(self, action, *args) -> bool:
+        """Run a phone action; show any problem in the window instead of crashing."""
+        try:
+            action(self.bus, *args)
+        except PhoneError as error:
+            self.show_note(str(error))
+            return False
+        except dbus.DBusException as error:
+            self.show_note(error.get_dbus_message() or str(error))
+            return False
+        self.show_note("")
+        return True
+
+    def call_or_answer(self) -> None:
+        if self.ringing:
+            self.attempt(answer)
+        elif not self.busy:
+            text = self.entry.get().strip()
+            if text:
+                self.attempt(dial, text)
+        self.refresh(reschedule=False)
+
+    def hang_up(self) -> None:
+        self.was_ringing = False   # turning a call down is not a missed call
+        self.attempt(hangup)
+        self.refresh(reschedule=False)
+
+    def on_keypad(self, key: str) -> None:
+        """A keypad button: types into the box, and in a call also sends the tone."""
+        self.entry.insert(self.tk.END, key)
+        beep(key)
+        if self.in_call:
+            self.attempt(send_tones, key)
+
+    def on_typed(self, event) -> None:
+        """A number key typed in the box beeps, and during a call sends its tone too."""
+        if event.char and event.char in TONE_KEYS:
+            beep(event.char)
+            if self.in_call:
+                self.attempt(send_tones, event.char)
+
+    def on_volume(self, _event=None) -> None:
+        """The slider was let go: tell the phone the new call volume."""
+        self.volume_held = False
+        self.attempt(set_call_volume, int(self.volume.get()))
+
+    def backspace(self) -> None:
+        text = self.entry.get()
+        self.entry.delete(0, self.tk.END)
+        self.entry.insert(0, text[:-1])
+
+    # -- keeping the window in step with the phone --
+
+    def refresh(self, reschedule: bool = True) -> None:
+        phone = connected_phone(self.bus)
+        try:
+            current = calls(self.bus, phone) if phone else []
+        except dbus.DBusException:
+            current = []
+        current = [(path, props) for path, props in current
+                   if str(props.get("State")) != "disconnected"]
+        states = [str(props.get("State")) for _path, props in current]
+        who = ""
+        if current:
+            # Show the ringing call first if there is one (call waiting).
+            ringing_calls = [props for _path, props in current
+                             if str(props.get("State")) in RINGING]
+            who = caller_text(ringing_calls[0] if ringing_calls else current[0][1])
+
+        self.ringing = any(state in RINGING for state in states)
+        self.busy = bool(current)
+        was_in_call = self.in_call
+        self.in_call = "active" in states
+        if self.in_call != was_in_call:
+            # The box now means something else (number to call <-> keys pressed), so empty it.
+            self.entry.delete(0, self.tk.END)
+            self.call_seconds = 0
+        elif self.in_call and reschedule:
+            self.call_seconds += 1
+
+        if self.ringing and not self.was_ringing:
+            # The phone has just started ringing: pop up and say who it is.
+            self.caller = who
+            self.show_window()
+            notify(f"Incoming call: {who}", "call-incoming")
+        elif self.was_ringing and not self.ringing and not self.in_call:
+            self.show_note(f"Missed call: {self.caller}", 600)
+            notify(f"Missed call: {self.caller}", "call-missed")
+        self.was_ringing = self.ringing
+
+        icon = "call-start"
+        if not phone:
+            status, hint = "No phone connected", "Connect your phone over Bluetooth."
+            icon = "call-stop"
+        elif self.ringing:
+            status, hint = f"Incoming call: {who}", "Answer, or Hang up to turn it down."
+            icon = "call-incoming"
+        elif self.in_call:
+            icon = "call-outgoing"
+            minutes, seconds = divmod(self.call_seconds, 60)
+            status = f"In call: {who}   {minutes}:{seconds:02d}"
+            hint = "Keypad and number keys send key tones."
+        elif "held" in states:
+            status, hint = f"On hold: {who}", ""
+        elif self.busy:
+            status, hint = f"Calling {who}...", ""
+        else:
+            status, hint = "Ready", "Number or contact name, then Call."
+        self.status.configure(text=status)
+        if self.tray:
+            # Leave the call timer out of the tooltip, so it isn't re-sent every second.
+            self.tray.update(icon, status.split("   ")[0])
+        self.hint.configure(text=hint)
+
+        if phone and not self.volume_held:
+            try:
+                self.volume.configure(state="normal")
+                self.volume.set(call_volume(self.bus, phone))
+            except dbus.DBusException:
+                pass
+        elif not phone:
+            self.volume.configure(state="disabled")
+
+        can_call = bool(phone) and (self.ringing or not self.busy)
+        self.call_button.configure(text="Answer" if self.ringing else "Call",
+                                   state="normal" if can_call else "disabled")
+        self.hangup_button.configure(state="normal" if self.busy else "disabled")
+
+        if reschedule:
+            if self.note_ticks > 0:
+                self.note_ticks -= 1
+                if self.note_ticks == 0:
+                    self.note.configure(text="")
+            self.root.after(1000, self.refresh)
+
+
+def hand_to_running_window(message: str) -> bool:
+    """If a Phone window is already running, pass it a message. True if one was."""
+    try:
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
+            client.settimeout(1)
+            client.connect(SOCKET_PATH)
+            client.sendall(message.encode("utf-8"))
+        return True
+    except OSError:
+        return False
+
+
+def start_listening() -> socket.socket | None:
+    """Open the socket other "phone" commands use to reach this window."""
+    try:
+        if os.path.exists(SOCKET_PATH):
+            os.remove(SOCKET_PATH)   # left over from a window that has gone
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        listener.bind(SOCKET_PATH)
+        listener.listen(4)
+        listener.setblocking(False)
+        return listener
+    except OSError:
+        return None
+
+
+def tel_number(text: str) -> str:
+    """The number out of a tel: link (anything else is returned unchanged)."""
+    if text.lower().startswith("tel:"):
+        return urllib.parse.unquote(text[4:]).split(";")[0]
+    return text
+
+
+def main() -> None:
+    args = sys.argv[1:]
+    command = args[0] if args else "ask"
+    rest = " ".join(args[1:])
+    window_wanted = command in ("ask", "watch") or (command == "dial" and not rest)
+    if window_wanted:
+        try:
+            # The tray icon needs D-Bus hooked up to an event loop before connecting.
+            from dbus.mainloop.glib import DBusGMainLoop
+            DBusGMainLoop(set_as_default=True)
+        except ImportError:
+            pass   # no tray icon then; everything else still works
+    bus = dbus.SessionBus()
+
+    if window_wanted:
+        number = "" if command == "watch" else tel_number(rest)
+        # Only one window: if it is already running, show that one instead.
+        if hand_to_running_window("ping" if command == "watch" else f"show {number}"):
+            return
+        PhoneWindow(bus, number, hidden=(command == "watch"),
+                    listener=start_listening()).run()
+        return
+    try:
+        if command == "dial":
+            notify(f"Calling {dial(bus, rest)}")
+        elif command == "answer":
+            answer(bus)
+            notify("Call answered")
+        elif command == "hangup":
+            hangup(bus)
+            notify("Hung up")
+        elif command == "tones":
+            send_tones(bus, re.sub(r"[^0-9*#]", "", rest))
+        elif command == "status":
+            phone = find_phone(bus)
+            print(f"Phone connected ({phone})")
+            current = calls(bus, phone)
+            for _path, props in current:
+                print(f"  {props.get('State')}: {props.get('LineIdentification') or 'unknown number'}")
+            if not current:
+                print("  no calls")
+        else:
+            print(__doc__)
+            sys.exit(2)
+    except PhoneError as error:
+        fail(str(error))
+    except dbus.DBusException as error:
+        fail(error.get_dbus_message() or str(error))
+
+
+if __name__ == "__main__":
+    main()
