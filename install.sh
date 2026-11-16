@@ -71,4 +71,4 @@ echo
 echo "Installed. Two things left:"
 echo "  1. Restart the audio service (sound cuts out for a second or two):"
 echo "         systemctl --user restart wireplumber"
-echo "  2. Pair your phone over Bluetooth - see README.txt"
+echo "  2. Pair your phone over Bluetooth - see README.md"
