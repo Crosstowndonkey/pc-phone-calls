@@ -13,6 +13,7 @@
   phone merge             join both calls into one conference call
   phone tones 1           press keys during a call (phone menus)
   phone clean on|off      send your voice through the noise-removing microphone
+  phone mictest           talk for 8 seconds; shows how loud you are, before and after
   phone status            show the connected phone and any calls
 
 It talks to PipeWire's telephony service, which controls the phone over the
@@ -834,6 +835,68 @@ def route_voice(clean: bool, nodes: list[dict] | None = None) -> int:
     return changed
 
 
+def speech_level(path: str) -> tuple[float, float] | None:
+    """(typical speaking level, loudest moment) of a recording, in dB below full volume."""
+    try:
+        with wave.open(path, "rb") as sound:
+            rate = sound.getframerate()
+            count = sound.getnframes()
+            samples = struct.unpack(f"<{count}h", sound.readframes(count))
+    except (OSError, EOFError, wave.Error, struct.error):
+        return None
+    samples = samples[rate // 2:]      # skip the start-up half second
+    window = rate // 10                 # measure a tenth of a second at a time
+    levels = []
+    for start in range(0, len(samples) - window, window):
+        power = sum(value * value for value in samples[start:start + window]) / window
+        levels.append(10 * math.log10(max(power, 1e-9) / (32768.0 ** 2)))
+    if not levels:
+        return None
+    loudest = max(levels)
+    # "Speaking" = the moments within 20 dB of the loudest one; the rest are pauses.
+    speaking = sorted(level for level in levels if level > loudest - 20)
+    return speaking[len(speaking) // 2], loudest
+
+
+def mic_test(seconds: int = 8) -> None:
+    """Record the normal mic and the clean mic at once, and print how loud each was."""
+    if not shutil.which("pw-record"):
+        raise PhoneError("pw-record is missing (it comes with PipeWire).")
+    has_clean = clean_mic_node(audio_nodes()) is not None
+    files = {"Normal microphone": os.path.join(TONE_FOLDER, "phone-mictest-raw.wav")}
+    if has_clean:
+        files["Phone clean mic"] = os.path.join(TONE_FOLDER, "phone-mictest-clean.wav")
+    print(f"Talk normally for {seconds} seconds, as if you were on a call...")
+    recorders = []
+    for name, path in files.items():
+        command = ["pw-record", "--channels", "1", "--rate", "48000"]
+        if name == "Phone clean mic":
+            command += ["--target", CLEAN_MIC]
+        recorders.append(subprocess.Popen(command + [path], stdout=subprocess.DEVNULL,
+                                          stderr=subprocess.DEVNULL))
+    try:
+        import time
+        time.sleep(seconds)
+    finally:
+        for recorder in recorders:
+            recorder.terminate()
+        for recorder in recorders:
+            recorder.wait(timeout=5)
+    print("Done. (0 dB is the loudest possible; -20 is healthy; -40 is very quiet)")
+    for name, path in files.items():
+        result = speech_level(path)
+        try:
+            os.remove(path)             # the recording itself is never kept
+        except OSError:
+            pass
+        if result is None or result[1] < -80:
+            print(f"  {name}: heard nothing")
+        else:
+            print(f"  {name}: speaking level {result[0]:.0f} dB, loudest moment {result[1]:.0f} dB")
+    if not has_clean:
+        print("  (The Phone clean mic is not set up - see the README.)")
+
+
 def tel_number(text: str) -> str:
     """The number out of a tel: link (anything else is returned unchanged)."""
     if text.lower().startswith("tel:"):
@@ -885,6 +948,8 @@ def main() -> None:
                 raise PhoneError("The Phone clean mic is not set up - see the README.")
             changed = route_voice(rest == "on", nodes)
             print(f"Clean voice {rest}" + ("" if changed else " (applies from the next call)"))
+        elif command == "mictest":
+            mic_test()
         elif command == "tones":
             send_tones(bus, re.sub(r"[^0-9*#]", "", rest))
         elif command == "status":

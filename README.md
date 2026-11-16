@@ -124,7 +124,11 @@ sudo pacman -S noise-suppression-for-voice
 - To tune it, edit
   `~/.config/pipewire/filter-chain.conf.d/phone-clean-mic.conf` (the comments
   explain the numbers), then run `systemctl --user restart filter-chain`.
-  If soft words get cut off, lower "VAD Threshold".
+  "VAD Threshold" is 0 by default (clean, but never mute). Raise it to 30-50
+  for dead-silent gaps between sentences, at the risk of clipped soft words.
+  "Dry Mix" blends a little of the untouched microphone back in (0.15 by
+  default): lower it for less background noise, raise it if your voice
+  sounds processed.
 - Terminal: `phone clean on` / `phone clean off`.
 
 ### Incoming calls
@@ -160,6 +164,7 @@ Right-clicking the app menu launcher also offers "Answer call" and "Hang up".
 | `phone merge` | Joins both calls into a conference call |
 | `phone tones 1` | Presses keys during a call |
 | `phone clean on` / `off` | Turns noise removal for your voice on or off |
+| `phone mictest` | Talk for 8 seconds; shows how loud you are on the normal mic and the clean mic |
 | `phone watch` | Starts hidden and waits for calls |
 | `phone status` | Shows the connected phone and any calls |
 
