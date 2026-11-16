@@ -60,6 +60,18 @@ Exec=$HOME/.local/bin/phone watch
 Icon=call-start
 DESKTOP
 
+# Optional: the noise-removing microphone behind "Clean up my voice".
+# It needs the RNNoise plugin; without it everything else still works.
+if [ -e /usr/lib/ladspa/librnnoise_ladspa.so ]; then
+    mkdir -p ~/.config/pipewire/filter-chain.conf.d
+    cp -f phone-clean-mic.conf ~/.config/pipewire/filter-chain.conf.d/phone-clean-mic.conf
+    systemctl --user enable filter-chain.service >/dev/null 2>&1 || true
+    systemctl --user restart filter-chain.service || true
+    clean_mic=yes
+else
+    clean_mic=no
+fi
+
 if [ ! -f ~/.config/phone-contacts.txt ]; then
     printf '# One contact per line:  name = number\n# Example:\n# mum = 0412 345 678\n' > ~/.config/phone-contacts.txt
 fi
@@ -72,3 +84,9 @@ echo "Installed. Two things left:"
 echo "  1. Restart the audio service (sound cuts out for a second or two):"
 echo "         systemctl --user restart wireplumber"
 echo "  2. Pair your phone over Bluetooth - see README.md"
+if [ "$clean_mic" = no ]; then
+    echo
+    echo "Optional - noise removal for your voice (\"Clean up my voice\" in the Phone window):"
+    echo "         sudo pacman -S noise-suppression-for-voice"
+    echo "     then run ./install.sh again."
+fi

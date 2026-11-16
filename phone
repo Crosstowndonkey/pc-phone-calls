@@ -8,7 +8,11 @@
   phone watch             start hidden and wait for calls (used at login)
   phone answer            answer the ringing call
   phone hangup            end all calls
+  phone hold              put the call on hold, or take it off hold
+  phone swap              switch between the call you're on and the one on hold
+  phone merge             join both calls into one conference call
   phone tones 1           press keys during a call (phone menus)
+  phone clean on|off      send your voice through the noise-removing microphone
   phone status            show the connected phone and any calls
 
 It talks to PipeWire's telephony service, which controls the phone over the
@@ -17,11 +21,16 @@ Bluetooth hands-free link. The call itself is made by the phone.
 The Phone window stays open during the call: Hang up ends it, and the keypad
 (or the number keys) sends key tones, for "press 1 for..." phone menus.
 The Call volume slider sets how loud the other person is.
+"Clean up my voice" sends your microphone through the Phone clean mic (noise
+removal) before it goes to the other person.
+Hold, Swap, Merge and Add call handle a second call: put one on hold, switch
+between two, or join them into a conference.
 Closing the window only hides it: it keeps running, and pops back up showing
 who is calling when the phone rings. The Quit button really closes it.
 While it runs there is a Phone icon in the system tray; click it to show or
 hide the window.
 """
+import json
 import math
 import os
 import re
@@ -44,6 +53,8 @@ OBJECT_MANAGER = "org.freedesktop.DBus.ObjectManager"
 PROPERTIES = "org.freedesktop.DBus.Properties"
 TRAY_IFACE = "org.kde.StatusNotifierItem"   # the system tray's way of talking to icons
 CONTACTS_FILE = os.path.expanduser("~/.config/phone-contacts.txt")
+SETTINGS_FILE = os.path.expanduser("~/.config/phone-settings.json")
+CLEAN_MIC = "phone_clean_mic"       # the noise-removing microphone (phone-clean-mic.conf)
 RINGING = ("incoming", "waiting")   # call states that mean "someone is calling you"
 TONE_KEYS = "123456789*0#"          # the keypad, in the order it is laid out
 # A running Phone window listens here, so opening Phone again shows that window
@@ -198,18 +209,68 @@ def dial(bus: dbus.Bus, text: str) -> str:
     return number
 
 
+def calls_in_state(current: list[tuple[str, dict]], *states: str) -> list[str]:
+    """The paths of the calls that are in one of these states."""
+    return [path for path, props in current if str(props.get("State")) in states]
+
+
 def answer(bus: dbus.Bus) -> None:
+    """Answer the ringing call. A call you are already on is put on hold, not ended."""
     phone = find_phone(bus)
-    ringing = [path for path, props in calls(bus, phone)
-               if str(props.get("State")) in RINGING]
+    current = calls(bus, phone)
+    ringing = calls_in_state(current, *RINGING)
     if not ringing:
         raise PhoneError("No call is ringing.")
-    dbus.Interface(bus.get_object(SERVICE, ringing[0]), CALL_IFACE).Answer()
+    if calls_in_state(current, "active", "held"):
+        dbus.Interface(bus.get_object(SERVICE, phone), AG_IFACE).HoldAndAnswer()
+    else:
+        dbus.Interface(bus.get_object(SERVICE, ringing[0]), CALL_IFACE).Answer()
 
 
 def hangup(bus: dbus.Bus) -> None:
+    """End every call."""
     phone = find_phone(bus)
     dbus.Interface(bus.get_object(SERVICE, phone), AG_IFACE).HangupAll()
+
+
+def hangup_one(bus: dbus.Bus) -> None:
+    """End just the call that Hang up most likely means, leaving any others alone.
+
+    A second call ringing in: turn that one down. One call active and one on
+    hold: end the active one (the held one waits for Resume). Otherwise: all.
+    """
+    phone = find_phone(bus)
+    current = calls(bus, phone)
+    ringing = calls_in_state(current, *RINGING)
+    active = calls_in_state(current, "active")
+    held = calls_in_state(current, "held")
+    if ringing and (active or held):
+        targets = ringing
+    elif active and held:
+        targets = active
+    else:
+        targets = []
+    if not targets:
+        dbus.Interface(bus.get_object(SERVICE, phone), AG_IFACE).HangupAll()
+    for path in targets:
+        dbus.Interface(bus.get_object(SERVICE, path), CALL_IFACE).Hangup()
+
+
+def swap_calls(bus: dbus.Bus) -> None:
+    """Hold / resume with one call; with two, switch which one you are talking to."""
+    phone = find_phone(bus)
+    if not calls_in_state(calls(bus, phone), "active", "held"):
+        raise PhoneError("There is no call to hold or swap.")
+    dbus.Interface(bus.get_object(SERVICE, phone), AG_IFACE).SwapCalls()
+
+
+def merge_calls(bus: dbus.Bus) -> None:
+    """Join the active call and the held call into one conference call."""
+    phone = find_phone(bus)
+    current = calls(bus, phone)
+    if not (calls_in_state(current, "active") and calls_in_state(current, "held")):
+        raise PhoneError("A conference needs one call active and one on hold.")
+    dbus.Interface(bus.get_object(SERVICE, phone), AG_IFACE).CreateMultiparty()
 
 
 def send_tones(bus: dbus.Bus, tones: str) -> None:
@@ -322,7 +383,7 @@ class PhoneWindow:
         self.root.resizable(False, False)
         self.root.configure(padx=14, pady=12)
 
-        self.status = tk.Label(self.root, text="", font=("sans", 12, "bold"))
+        self.status = tk.Label(self.root, text="", font=("sans", 12, "bold"), wraplength=280)
         self.status.grid(row=0, column=0, columnspan=3, pady=(0, 6))
 
         self.entry = tk.Entry(self.root, font=("sans", 18), justify="center", width=16)
@@ -332,7 +393,7 @@ class PhoneWindow:
         self.entry.bind("<Key>", self.on_typed)
         self.entry.focus_set()
 
-        self.hint = tk.Label(self.root, text="", font=("sans", 9), fg="#666666")
+        self.hint = tk.Label(self.root, text="", font=("sans", 9), fg="#666666", wraplength=280)
         self.hint.grid(row=2, column=0, columnspan=3, pady=(2, 8))
 
         for index, key in enumerate(TONE_KEYS):
@@ -351,25 +412,52 @@ class PhoneWindow:
                                        activeforeground="white", command=self.hang_up)
         self.hangup_button.grid(row=7, column=2, sticky="ew", padx=3, pady=(10, 0), ipady=4)
 
+        # Second-call controls: hold, swap, merge (conference) and adding a call.
+        controls = tk.Frame(self.root)
+        controls.grid(row=8, column=0, columnspan=3, sticky="ew", pady=(8, 0))
+        self.hold_button = tk.Button(controls, text="Hold", font=("sans", 9),
+                                     command=lambda: self.call_control(swap_calls))
+        self.swap_button = tk.Button(controls, text="Swap", font=("sans", 9),
+                                     command=lambda: self.call_control(swap_calls))
+        self.merge_button = tk.Button(controls, text="Merge", font=("sans", 9),
+                                      command=lambda: self.call_control(merge_calls))
+        self.add_button = tk.Button(controls, text="Add call", font=("sans", 9),
+                                    command=self.add_call)
+        for column, button in enumerate((self.hold_button, self.swap_button,
+                                         self.merge_button, self.add_button)):
+            controls.columnconfigure(column, weight=1, uniform="controls")
+            button.grid(row=0, column=column, sticky="ew", padx=2)
+
         self.note = tk.Label(self.root, text="", font=("sans", 9), fg="#c0392b",
                              wraplength=260)
-        self.note.grid(row=8, column=0, columnspan=3, pady=(8, 0))
+        self.note.grid(row=9, column=0, columnspan=3, pady=(8, 0))
 
         # Call volume: how loud the other person is. It is the phone's own call
         # volume, so the phone's volume buttons move this slider too.
         tk.Label(self.root, text="Call volume", font=("sans", 9)
-                 ).grid(row=9, column=0, sticky="w", pady=(8, 0))
+                 ).grid(row=10, column=0, sticky="w", pady=(8, 0))
         self.volume = tk.Scale(self.root, from_=0, to=15, orient="horizontal",
                                showvalue=True, font=("sans", 8))
-        self.volume.grid(row=9, column=1, columnspan=2, sticky="ew", pady=(8, 0))
+        self.volume.grid(row=10, column=1, columnspan=2, sticky="ew", pady=(8, 0))
         self.volume_held = False   # the mouse is dragging it: don't move it under the hand
         self.volume.bind("<ButtonPress-1>", lambda _event: setattr(self, "volume_held", True))
         self.volume.bind("<ButtonRelease-1>", self.on_volume)
         self.volume.bind("<KeyRelease>", self.on_volume)
 
+        # Noise removal for your own voice (needs the Phone clean mic to be set up).
+        self.clean_voice = tk.BooleanVar(value=bool(load_settings().get("clean_voice", True)))
+        self.clean_box = tk.Checkbutton(self.root, text="Clean up my voice (noise removal)",
+                                        font=("sans", 9), variable=self.clean_voice,
+                                        command=self.on_clean_voice)
+        self.clean_box.grid(row=11, column=0, columnspan=3, sticky="w", pady=(4, 0))
+        self.voice_routed = False   # this call's microphone has been pointed the right way
+        self.clean_available = False
+        self.clean_check_in = 0     # seconds until the next look for the clean mic
+        self.check_clean_mic()
+
         tk.Button(self.root, text="Quit (stop watching for calls)", font=("sans", 8),
                   relief="flat", fg="#666666", command=self.root.destroy
-                  ).grid(row=10, column=0, columnspan=3, pady=(6, 0))
+                  ).grid(row=12, column=0, columnspan=3, pady=(6, 0))
 
         # The window's X button hides it; it keeps running to catch incoming calls.
         self.root.protocol("WM_DELETE_WINDOW", self.root.withdraw)
@@ -460,7 +548,7 @@ class PhoneWindow:
 
     def hang_up(self) -> None:
         self.was_ringing = False   # turning a call down is not a missed call
-        self.attempt(hangup)
+        self.attempt(hangup_one)
         self.refresh(reschedule=False)
 
     def on_keypad(self, key: str) -> None:
@@ -476,6 +564,47 @@ class PhoneWindow:
             beep(event.char)
             if self.in_call:
                 self.attempt(send_tones, event.char)
+
+    def on_clean_voice(self) -> None:
+        """The tick box was clicked: remember it, and apply it to a call in progress."""
+        save_setting("clean_voice", bool(self.clean_voice.get()))
+        self.voice_routed = False
+        self.apply_voice_routing()
+
+    def check_clean_mic(self) -> None:
+        """Is the clean mic there? (It may start after Phone does, or be installed later.)"""
+        self.clean_check_in = 10
+        self.clean_available = clean_mic_node(audio_nodes()) is not None
+        if self.clean_available:
+            self.clean_box.configure(state="normal", text="Clean up my voice (noise removal)")
+        else:
+            self.clean_box.configure(state="disabled",
+                                     text="Clean up my voice (not set up - see README)")
+
+    def apply_voice_routing(self) -> None:
+        """During a call, send the microphone through the clean mic if the box is ticked.
+
+        The call's sound only appears a moment after the call connects, so this is
+        tried again each second until it has been done once.
+        """
+        if not self.clean_available or not self.in_call or self.voice_routed:
+            return
+        if route_voice(bool(self.clean_voice.get())) > 0:
+            self.voice_routed = True
+
+    def call_control(self, action) -> None:
+        """Hold, Swap or Merge was pressed."""
+        self.attempt(action)
+        self.refresh(reschedule=False)
+
+    def add_call(self) -> None:
+        """Ask for a second number and ring it; the phone holds the first call meanwhile."""
+        from tkinter import simpledialog
+        text = simpledialog.askstring("Add call", "Number or contact name to add:",
+                                      parent=self.root)
+        if text and text.strip():
+            self.attempt(dial, text.strip())
+            self.refresh(reschedule=False)
 
     def on_volume(self, _event=None) -> None:
         """The slider was let go: tell the phone the new call volume."""
@@ -498,17 +627,20 @@ class PhoneWindow:
         current = [(path, props) for path, props in current
                    if str(props.get("State")) != "disconnected"]
         states = [str(props.get("State")) for _path, props in current]
-        who = ""
-        if current:
-            # Show the ringing call first if there is one (call waiting).
-            ringing_calls = [props for _path, props in current
-                             if str(props.get("State")) in RINGING]
-            who = caller_text(ringing_calls[0] if ringing_calls else current[0][1])
 
-        self.ringing = any(state in RINGING for state in states)
+        def people(*wanted: str) -> list[str]:
+            """Who the calls in these states are with."""
+            return [caller_text(props) for _path, props in current
+                    if str(props.get("State")) in wanted]
+
+        ringing, active, held = people(*RINGING), people("active"), people("held")
+        dialling = people("dialing", "alerting")
+        who = (ringing or dialling or active or held or [""])[0]
+
+        self.ringing = bool(ringing)
         self.busy = bool(current)
         was_in_call = self.in_call
-        self.in_call = "active" in states
+        self.in_call = bool(active or held)   # a call is connected, talking or on hold
         if self.in_call != was_in_call:
             # The box now means something else (number to call <-> keys pressed), so empty it.
             self.entry.delete(0, self.tk.END)
@@ -521,29 +653,54 @@ class PhoneWindow:
             self.caller = who
             self.show_window()
             notify(f"Incoming call: {who}", "call-incoming")
-        elif self.was_ringing and not self.ringing and not self.in_call:
+        elif self.was_ringing and not self.ringing and len(active) + len(held) < 2 \
+                and self.caller not in active + held:
             self.show_note(f"Missed call: {self.caller}", 600)
             notify(f"Missed call: {self.caller}", "call-missed")
         self.was_ringing = self.ringing
+        if reschedule and not self.clean_available:
+            self.clean_check_in -= 1
+            if self.clean_check_in <= 0:
+                self.check_clean_mic()
+        if not self.in_call:
+            self.voice_routed = False   # the next call gets routed afresh
+        elif reschedule:
+            self.apply_voice_routing()
 
+        minutes, seconds = divmod(self.call_seconds, 60)
+        timer = f"   {minutes}:{seconds:02d}"
+        on_hold = "On hold: " + ", ".join(held)
         icon = "call-start"
         if not phone:
             status, hint = "No phone connected", "Connect your phone over Bluetooth."
             icon = "call-stop"
         elif self.ringing:
             status, hint = f"Incoming call: {who}", "Answer, or Hang up to turn it down."
+            if self.in_call:
+                hint = "Answer holds your current call. Hang up turns this one down."
             icon = "call-incoming"
-        elif self.in_call:
+        elif dialling:
+            status, hint = f"Calling {who}...", on_hold if held else ""
             icon = "call-outgoing"
-            minutes, seconds = divmod(self.call_seconds, 60)
-            status = f"In call: {who}   {minutes}:{seconds:02d}"
-            hint = "Keypad and number keys send key tones."
-        elif "held" in states:
-            status, hint = f"On hold: {who}", ""
-        elif self.busy:
-            status, hint = f"Calling {who}...", ""
+        elif active:
+            icon = "call-outgoing"
+            status = ("Conference: " if len(active) > 1 else "In call: ") + " + ".join(active) + timer
+            hint = on_hold if held else "Keypad and number keys send key tones."
+        elif held:
+            status, hint = on_hold + timer, "Resume to carry on talking."
         else:
             status, hint = "Ready", "Number or contact name, then Call."
+
+        # Which of the second-call buttons make sense right now.
+        settled = bool(phone) and not ringing and not dialling
+        one_side = bool(active) != bool(held)   # calls only talking, or only on hold
+        self.hold_button.configure(text="Resume" if held and not active else "Hold",
+                                   state="normal" if settled and one_side else "disabled")
+        both = "normal" if settled and active and held else "disabled"
+        self.swap_button.configure(state=both)
+        self.merge_button.configure(state=both)
+        self.add_button.configure(state="normal" if settled and one_side else "disabled")
+
         self.status.configure(text=status)
         if self.tray:
             # Leave the call timer out of the tooltip, so it isn't re-sent every second.
@@ -598,6 +755,85 @@ def start_listening() -> socket.socket | None:
         return None
 
 
+def load_settings() -> dict:
+    """The saved tick boxes (an empty dict if nothing was saved yet)."""
+    try:
+        with open(SETTINGS_FILE, encoding="utf-8") as handle:
+            settings = json.load(handle)
+        return settings if isinstance(settings, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def save_setting(name: str, value) -> None:
+    settings = load_settings()
+    settings[name] = value
+    try:
+        with open(SETTINGS_FILE, "w", encoding="utf-8") as handle:
+            json.dump(settings, handle, indent=2)
+    except OSError:
+        pass
+
+
+def audio_nodes() -> list[dict]:
+    """Every sound device and stream PipeWire knows about, as {"id": ..., "props": {...}}."""
+    try:
+        result = subprocess.run(["pw-dump"], capture_output=True, text=True, timeout=5, check=False)
+        objects = json.loads(result.stdout)
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return []
+    nodes = []
+    for item in objects:
+        if isinstance(item, dict) and str(item.get("type", "")).endswith(":Node"):
+            nodes.append({"id": item.get("id"), "props": (item.get("info") or {}).get("props") or {}})
+    return nodes
+
+
+def clean_mic_node(nodes: list[dict]) -> dict | None:
+    """The noise-removing microphone, if it is set up and running."""
+    for node in nodes:
+        if node["props"].get("node.name") == CLEAN_MIC:
+            return node
+    return None
+
+
+def is_phone_mic_stream(props: dict) -> bool:
+    """Is this the stream that carries your voice to the phone during a call?
+
+    To PipeWire the phone looks like a program recording from a microphone.
+    """
+    from_bluetooth = (props.get("device.api") == "bluez5"
+                      or str(props.get("node.name", "")).startswith("bluez_"))
+    return from_bluetooth and props.get("media.class") == "Stream/Input/Audio"
+
+
+def route_voice(clean: bool, nodes: list[dict] | None = None) -> int:
+    """Point the call's microphone at the clean mic (or back at the normal one).
+
+    Returns how many call streams were changed (0 when no call audio is up).
+    """
+    nodes = audio_nodes() if nodes is None else nodes
+    target = clean_mic_node(nodes)
+    changed = 0
+    for node in nodes:
+        if not is_phone_mic_stream(node["props"]):
+            continue
+        node_id = str(node["id"])
+        if clean and target:
+            # "Use this microphone": the same note the volume widget leaves when you
+            # move a recording stream to another device.
+            command = ["pw-metadata", node_id, "target.object",
+                       str(target["props"].get("object.serial")), "Spa:Id"]
+        else:
+            command = ["pw-metadata", "-d", node_id, "target.object"]
+        try:
+            subprocess.run(command, capture_output=True, timeout=5, check=False)
+            changed += 1
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    return changed
+
+
 def tel_number(text: str) -> str:
     """The number out of a tel: link (anything else is returned unchanged)."""
     if text.lower().startswith("tel:"):
@@ -636,6 +872,19 @@ def main() -> None:
         elif command == "hangup":
             hangup(bus)
             notify("Hung up")
+        elif command in ("hold", "swap"):
+            swap_calls(bus)
+        elif command == "merge":
+            merge_calls(bus)
+        elif command == "clean":
+            if rest not in ("on", "off"):
+                raise PhoneError("Use: phone clean on   or   phone clean off")
+            save_setting("clean_voice", rest == "on")
+            nodes = audio_nodes()
+            if rest == "on" and not clean_mic_node(nodes):
+                raise PhoneError("The Phone clean mic is not set up - see the README.")
+            changed = route_voice(rest == "on", nodes)
+            print(f"Clean voice {rest}" + ("" if changed else " (applies from the next call)"))
         elif command == "tones":
             send_tones(bus, re.sub(r"[^0-9*#]", "", rest))
         elif command == "status":

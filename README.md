@@ -15,7 +15,11 @@ hands-free standard and should work the same way, but that is untested.
 - **Key tones** for "press 1 for accounts" phone menus.
 - **Incoming calls** pop the window up, showing the caller's number, or their
   name if they're in your contacts file.
+- **Hold, swap and conference calls:** put a call on hold, add a second call,
+  switch between two, or join them together.
 - **Call volume** slider.
+- **Noise removal for your voice** (optional): fans, keyboard and background
+  noise are cleaned off your microphone before the other person hears it.
 - **System tray icon** that shows it's running and changes with the call state.
 - Clicking a **phone-number link** on a web page fills the number in.
 - Everything is also available as **terminal commands**.
@@ -73,6 +77,56 @@ keypad) and press **Call**. The window stays open during the call:
 
 Closing the window does not end the call.
 
+### Hold, second calls and conference calls
+
+The row of small buttons under Call and Hang up:
+
+| Button | What it does |
+| --- | --- |
+| **Hold** / **Resume** | Puts the call on hold, or takes it off hold |
+| **Add call** | Asks for a second number and rings it; the first call waits on hold |
+| **Swap** | With one call active and one on hold, switches which one you're talking to |
+| **Merge** | Joins the active call and the held call into one conference call |
+
+- If someone rings while you're on a call, **Answer** puts your current call
+  on hold and picks up the new one. **Hang up** turns the new one down and
+  leaves you on your call.
+- With one call active and one on hold, **Hang up** ends only the one you're
+  talking to. Press **Resume** to go back to the other.
+- In a conference, **Hang up** ends it for everyone.
+
+Whether hold and conference work depends on your phone and your mobile
+plan: the PC only asks the phone to do it.
+
+### Clean up my voice (noise removal)
+
+Optional. It adds a virtual microphone called **Phone clean mic**: your normal
+microphone with background noise (fans, keyboard, traffic) and low rumble
+removed. With **Clean up my voice** ticked in the Phone window, that is what
+the other person hears. Untick it during a call to compare; the choice is
+remembered.
+
+To set it up:
+
+```
+sudo pacman -S noise-suppression-for-voice
+./install.sh
+```
+
+- The noise removal is [RNNoise](https://github.com/werman/noise-suppression-for-voice),
+  the same kind OBS offers.
+- It uses your default microphone. Don't make "Phone clean mic" itself the
+  default microphone.
+- Other programs (Discord, OBS, a browser) can pick "Phone clean mic" as
+  their microphone too.
+- It only cleans; it doesn't make you louder. A phone line also carries less
+  detail than a headset, so expect "clear", not "studio".
+- To tune it, edit
+  `~/.config/pipewire/filter-chain.conf.d/phone-clean-mic.conf` (the comments
+  explain the numbers), then run `systemctl --user restart filter-chain`.
+  If soft words get cut off, lower "VAD Threshold".
+- Terminal: `phone clean on` / `phone clean off`.
+
 ### Incoming calls
 
 Phone starts hidden when you log in and waits. When the phone rings, the
@@ -101,7 +155,11 @@ Right-clicking the app menu launcher also offers "Answer call" and "Hang up".
 | `phone dial 0412345678` | Dials straight away (a contact name works too) |
 | `phone answer` | Answers the ringing call |
 | `phone hangup` | Ends all calls |
+| `phone hold` | Puts the call on hold, or takes it off hold |
+| `phone swap` | Switches between the active call and the held one |
+| `phone merge` | Joins both calls into a conference call |
 | `phone tones 1` | Presses keys during a call |
+| `phone clean on` / `off` | Turns noise removal for your voice on or off |
 | `phone watch` | Starts hidden and waits for calls |
 | `phone status` | Shows the connected phone and any calls |
 
@@ -120,6 +178,9 @@ Right-clicking the app menu launcher also offers "Answer call" and "Hang up".
 - **No sound in a call:** while the call is up, open the volume widget in the
   tray. The phone shows as an extra playback and recording stream; point them
   at your headset and your microphone.
+- **"Clean up my voice (not set up)":** the RNNoise plugin isn't installed or
+  the filter isn't running. See "Clean up my voice" above; check with
+  `systemctl --user status filter-chain`.
 - **The other person is too quiet:** move the Call volume slider up, or press
   volume up on the phone during the call.
 - **"Phone connected" never shows on a Samsung:** check the "Calls" switch
@@ -148,6 +209,8 @@ Everything goes inside your home folder:
 | `~/.config/autostart/phone-watch.desktop` | Starts Phone hidden at login |
 | `~/.config/wireplumber/wireplumber.conf.d/50-phone-calls.conf` | Turns on hands-free mode |
 | `~/.config/phone-contacts.txt` | Your contacts (optional) |
+| `~/.config/phone-settings.json` | The window's tick boxes (made when you first change one) |
+| `~/.config/pipewire/filter-chain.conf.d/phone-clean-mic.conf` | The noise-removing microphone (only with the RNNoise plugin) |
 
 ## Licence
 
