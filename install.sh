@@ -84,6 +84,11 @@ echo "Installed. Two things left:"
 echo "  1. Restart the audio service (sound cuts out for a second or two):"
 echo "         systemctl --user restart wireplumber"
 echo "  2. Pair your phone over Bluetooth - see README.md"
+if ! [ -e /usr/share/dbus-1/services/org.bluez.obex.service ]; then
+    echo
+    echo "Optional - your phone's contacts in the Phone window (Contacts > Sync from phone):"
+    echo "         sudo pacman -S bluez-obex"
+fi
 if [ "$clean_mic" = no ]; then
     echo
     echo "Optional - noise removal for your voice (\"Clean up my voice\" in the Phone window):"

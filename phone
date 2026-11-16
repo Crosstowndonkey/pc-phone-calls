@@ -2,7 +2,8 @@
 """Make, answer and end calls on the Bluetooth-connected phone from the PC.
 
   phone dial 0412345678   dial straight away
-  phone dial mum          dial a name from ~/.config/phone-contacts.txt
+  phone dial mum          dial a contact's name (yours or the phone's)
+  phone sync              copy the phone's contacts to the PC (needs bluez-obex)
   phone                   open the Phone window (keypad, Call, Hang up)
   phone ask [tel:...]     open the window with the number filled in (used for links)
   phone watch             start hidden and wait for calls (used at login)
@@ -26,6 +27,10 @@ The Call volume slider sets how loud the other person is.
 removal) before it goes to the other person.
 Hold, Swap, Merge and Add call handle a second call: put one on hold, switch
 between two, or join them into a conference.
+Contacts opens your contacts: search, double-click to call. They come from the
+phone (copied over Bluetooth once a day while it's connected, or with Sync from
+phone) plus your own list in ~/.config/phone-contacts.txt (Edit my own list).
+Mic test records you for 8 seconds and shows how loud you are.
 Closing the window only hides it: it keeps running, and pops back up showing
 who is calling when the phone rings. The Quit button really closes it.
 While it runs there is a Phone icon in the system tray; click it to show or
@@ -54,7 +59,15 @@ OBJECT_MANAGER = "org.freedesktop.DBus.ObjectManager"
 PROPERTIES = "org.freedesktop.DBus.Properties"
 TRAY_IFACE = "org.kde.StatusNotifierItem"   # the system tray's way of talking to icons
 CONTACTS_FILE = os.path.expanduser("~/.config/phone-contacts.txt")
+PHONE_BOOK_FILE = os.path.expanduser("~/.config/phone-contacts-from-phone.json")
 SETTINGS_FILE = os.path.expanduser("~/.config/phone-settings.json")
+OBEX_SERVICE = "org.bluez.obex"     # obexd: Bluetooth file / phone book transfers
+OBEX_ROOT = "/org/bluez/obex"
+OBEX_CLIENT = "org.bluez.obex.Client1"
+PBAP_IFACE = "org.bluez.obex.PhonebookAccess1"
+TRANSFER_IFACE = "org.bluez.obex.Transfer1"
+PBAP_UUID = "0000112f-0000-1000-8000-00805f9b34fb"   # "I can share my phone book"
+SYNC_EVERY = 24 * 3600              # copy the phone's contacts again after a day
 CLEAN_MIC = "phone_clean_mic"       # the noise-removing microphone (phone-clean-mic.conf)
 RINGING = ("incoming", "waiting")   # call states that mean "someone is calling you"
 TONE_KEYS = "123456789*0#"          # the keypad, in the order it is laid out
@@ -159,32 +172,226 @@ def calls(bus: dbus.Bus, phone: str) -> list[tuple[str, dict]]:
     return found
 
 
-def load_contacts() -> dict[str, str]:
-    """Read 'name = number' lines from the contacts file (if there is one)."""
-    contacts: dict[str, str] = {}
+def file_contacts() -> list[tuple[str, str, str]]:
+    """Your own contacts: 'name = number' lines from the contacts file, as (name, label, number)."""
+    found = []
     if not os.path.exists(CONTACTS_FILE):
-        return contacts
+        return found
     with open(CONTACTS_FILE, encoding="utf-8") as handle:
         for line in handle:
-            line = line.split("#")[0] if line.lstrip().startswith("#") else line
-            if "=" in line:
-                name, number = line.split("=", 1)
-                contacts[name.strip().lower()] = number.strip()
+            if line.lstrip().startswith("#") or "=" not in line:
+                continue
+            name, number = (part.strip() for part in line.split("=", 1))
+            if name and number:
+                found.append((name.title() if name.islower() else name, "", number))
+    return found
+
+
+phone_book_cache: dict = {"mtime": None, "contacts": []}
+
+
+def phone_book_contacts() -> list[tuple[str, str, str]]:
+    """The contacts last copied from the phone (see sync_contacts), as (name, label, number).
+
+    The file is only read again when it has changed, because the window looks up
+    callers' names every second.
+    """
+    try:
+        mtime = os.path.getmtime(PHONE_BOOK_FILE)
+    except OSError:
+        return []
+    if phone_book_cache["mtime"] != mtime:
+        found = []
+        try:
+            with open(PHONE_BOOK_FILE, encoding="utf-8") as handle:
+                for person in json.load(handle).get("contacts", []):
+                    for label, number in person.get("numbers", []):
+                        found.append((str(person.get("name", "")), str(label), str(number)))
+        except (OSError, ValueError, AttributeError, TypeError):
+            found = []
+        phone_book_cache.update(mtime=mtime, contacts=found)
+    return phone_book_cache["contacts"]
+
+
+def all_contacts() -> list[tuple[str, str, str]]:
+    """Every contact: your own file first, then the phone's. (name, label, number)."""
+    return file_contacts() + phone_book_contacts()
+
+
+def load_contacts() -> dict[str, str]:
+    """Contact names (lower case) and the number each one dials.
+
+    If a name is in both your file and the phone, your file wins. A phone contact
+    with several numbers dials the first (mobile numbers come first).
+    """
+    contacts: dict[str, str] = {}
+    for name, _label, number in all_contacts():
+        contacts.setdefault(name.lower(), number)
     return contacts
 
 
 def caller_text(props: dict) -> str:
-    """Who a call is with: the contact's name if the number is in the contacts file."""
+    """Who a call is with: the contact's name if the number is in your contacts."""
     number = str(props.get("LineIdentification") or "")
     if not number:
         return str(props.get("Name") or "") or "unknown number"
     digits = re.sub(r"\D", "", number)
-    for name, contact_number in load_contacts().items():
+    for name, _label, contact_number in all_contacts():
         contact_digits = re.sub(r"\D", "", contact_number)
         # Compare the last 8 digits, so 0412 345 678 matches +61 412 345 678.
         if len(digits) >= 8 and len(contact_digits) >= 8 and digits[-8:] == contact_digits[-8:]:
-            return f"{name.title()} ({number})"
+            return f"{name} ({number})"
     return number
+
+
+# -- copying contacts from the phone (PBAP, the Bluetooth "phone book" service) --
+
+TEL_LABELS = {"CELL": "mobile", "IPHONE": "iPhone", "HOME": "home", "WORK": "work",
+              "MAIN": "main", "PAGER": "pager"}
+
+
+def vcard_value(text: str) -> str:
+    r"""Undo vCard escaping: \, \; \n and \\."""
+    return re.sub(r"\\(.)", lambda m: "\n" if m.group(1) in "nN" else m.group(1), text)
+
+
+def parse_vcards(text: str) -> list[dict]:
+    """Read the phone's contacts (vCard text) into [{"name": ..., "numbers": [[label, number]]}]."""
+    lines: list[str] = []
+    for raw in text.splitlines():
+        if lines and lines[-1].endswith("=") and "QUOTED-PRINTABLE" in lines[-1].upper():
+            lines[-1] = lines[-1][:-1] + raw          # an old-style (vCard 2.1) soft line break
+        elif lines and raw[:1] in (" ", "\t"):
+            lines[-1] += raw[1:]                      # a long line folded onto the next one
+        else:
+            lines.append(raw)
+    people, card = [], None
+    for line in lines:
+        if ":" not in line:
+            continue
+        key, value = line.split(":", 1)
+        params = key.split(";")
+        field = params[0].split(".")[-1].upper()      # "item1.TEL" is just TEL
+        upper_params = [param.upper() for param in params[1:]]
+        if "ENCODING=QUOTED-PRINTABLE" in upper_params or "QUOTED-PRINTABLE" in upper_params:
+            import quopri
+            value = quopri.decodestring(value.encode("latin-1", "replace")).decode("utf-8", "replace")
+        if field == "BEGIN":
+            card = {"fn": "", "n": "", "org": "", "numbers": []}
+        elif card is None:
+            continue
+        elif field == "FN":
+            card["fn"] = vcard_value(value).strip()
+        elif field == "N":
+            parts = [vcard_value(part).strip() for part in re.split(r"(?<!\\);", value)] + [""] * 5
+            card["n"] = " ".join(part for part in (parts[3], parts[1], parts[2], parts[0], parts[4]) if part)
+        elif field == "ORG":
+            card["org"] = vcard_value(value.split(";")[0]).strip()
+        elif field == "TEL":
+            number = value.strip()
+            types = {kind for param in upper_params
+                     for kind in param.replace("TYPE=", "").replace('"', "").split(",")}
+            if not number or "FAX" in types:
+                continue
+            label = next((TEL_LABELS[kind] for kind in TEL_LABELS if kind in types), "phone")
+            card["numbers"].append([label, number])
+        elif field == "END":
+            name = card["fn"] or card["n"] or card["org"]
+            if card["numbers"]:
+                # Mobile numbers first: a name on its own dials the first number.
+                card["numbers"].sort(key=lambda entry: entry[0] not in ("mobile", "iPhone"))
+                people.append({"name": name or card["numbers"][0][1], "numbers": card["numbers"]})
+            card = None
+    people.sort(key=lambda person: person["name"].lower())
+    return people
+
+
+NOT_SHARING = ("The phone isn't sharing its contacts with this PC (it says it has none). "
+               "On an iPhone: Settings > Bluetooth > (i) next to this PC > turn on Sync Contacts. "
+               "Then turn the iPhone's Bluetooth off and on, and press Sync from phone again.")
+
+
+def phone_bluetooth_address() -> str:
+    """The Bluetooth address of the connected phone that can share its contacts."""
+    system = dbus.SystemBus()
+    manager = dbus.Interface(system.get_object("org.bluez", "/"), OBJECT_MANAGER)
+    for _path, interfaces in manager.GetManagedObjects().items():
+        device = interfaces.get("org.bluez.Device1")
+        if device and device.get("Connected") and \
+                PBAP_UUID in [str(uuid).lower() for uuid in device.get("UUIDs", [])]:
+            return str(device["Address"])
+    raise PhoneError("No connected phone offers its contacts over Bluetooth. "
+                     "Connect your phone first.")
+
+
+def wait_for_transfer(bus: dbus.Bus, transfer: str, filename: str) -> None:
+    """Wait until the phone has finished sending the contacts file."""
+    import time
+    properties = dbus.Interface(bus.get_object(OBEX_SERVICE, transfer), PROPERTIES)
+    deadline = time.monotonic() + 120
+    while time.monotonic() < deadline:
+        try:
+            status = str(properties.Get(TRANSFER_IFACE, "Status"))
+        except dbus.DBusException:
+            # The transfer is tidied away as soon as it is finished.
+            if os.path.exists(filename) and os.path.getsize(filename) > 0:
+                return
+            raise PhoneError(NOT_SHARING)
+        if status == "complete":
+            return
+        if status == "error":
+            raise PhoneError("The phone stopped sending its contacts.")
+        time.sleep(0.25)
+    raise PhoneError("The phone took too long to send its contacts.")
+
+
+def sync_contacts(bus: dbus.Bus) -> int:
+    """Copy the phone's contacts to PHONE_BOOK_FILE. Returns how many people there are.
+
+    This uses obexd (package bluez-obex), which speaks the Bluetooth phone book
+    service. Nothing is changed on the phone; it is a one-way copy.
+    """
+    address = phone_bluetooth_address()
+    try:
+        client = dbus.Interface(bus.get_object(OBEX_SERVICE, OBEX_ROOT), OBEX_CLIENT)
+        session = client.CreateSession(address, {"Target": "PBAP"}, timeout=60)
+    except dbus.DBusException as error:
+        if "ServiceUnknown" in (error.get_dbus_name() or ""):
+            raise PhoneError("Copying contacts needs bluez-obex. Install it with: "
+                             "sudo pacman -S bluez-obex") from error
+        raise PhoneError("The phone would not share its contacts. On an iPhone: Settings > "
+                         "Bluetooth > (i) next to this PC > turn on Sync Contacts, then try "
+                         f"again. ({error.get_dbus_message()})") from error
+    filename = ""
+    try:
+        book = dbus.Interface(bus.get_object(OBEX_SERVICE, session), PBAP_IFACE)
+        book.Select("int", "pb", timeout=60)
+        if int(book.GetSize(timeout=60)) == 0:
+            # An iPhone that hasn't been allowed to share says it has no contacts at all.
+            raise PhoneError(NOT_SHARING)
+        filters = {"Format": "vcard30",
+                   "Fields": dbus.Array(["VERSION", "FN", "N", "TEL", "ORG"], signature="s")}
+        transfer, props = book.PullAll("", filters, timeout=60)
+        filename = str(props.get("Filename", ""))
+        wait_for_transfer(bus, str(transfer), filename)
+        with open(filename, encoding="utf-8", errors="replace") as handle:
+            people = parse_vcards(handle.read())
+    except dbus.DBusException as error:
+        raise PhoneError(f"Could not copy the contacts: {error.get_dbus_message()}") from error
+    finally:
+        try:
+            client.RemoveSession(session)
+        except dbus.DBusException:
+            pass
+        if filename and os.path.exists(filename):
+            os.remove(filename)
+    if not people:
+        raise PhoneError(NOT_SHARING)
+    temporary = PHONE_BOOK_FILE + ".new"
+    with open(temporary, "w", encoding="utf-8") as handle:
+        json.dump({"contacts": people}, handle, ensure_ascii=False, indent=1)
+    os.replace(temporary, PHONE_BOOK_FILE)   # all at once, so it is never half-written
+    return len(people)
 
 
 def clean_number(text: str) -> str:
@@ -358,6 +565,23 @@ class TrayIcon(dbus.service.Object):
         pass
 
 
+class BackgroundJob:
+    """Runs a slow "phone ..." command as a separate program, so the window doesn't freeze."""
+
+    def __init__(self, *args: str) -> None:
+        self.process = subprocess.Popen([sys.executable, os.path.abspath(__file__), *args],
+                                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                        stdin=subprocess.DEVNULL, text=True)
+
+    def finished(self) -> bool:
+        return self.process.poll() is not None
+
+    def result(self) -> tuple[bool, str]:
+        """(did it work, what it printed)."""
+        output = self.process.communicate()[0].strip()
+        return self.process.returncode == 0, output or "Done."
+
+
 class PhoneWindow:
     """The Phone window: a number box, a keypad, Call and Hang up.
 
@@ -456,9 +680,25 @@ class PhoneWindow:
         self.clean_check_in = 0     # seconds until the next look for the clean mic
         self.check_clean_mic()
 
+        # Contacts (yours and the phone's) and the microphone check.
+        extras = tk.Frame(self.root)
+        extras.grid(row=12, column=0, columnspan=3, sticky="ew", pady=(8, 0))
+        extras.columnconfigure(0, weight=1, uniform="extras")
+        extras.columnconfigure(1, weight=1, uniform="extras")
+        tk.Button(extras, text="Contacts", font=("sans", 9), command=self.open_contacts
+                  ).grid(row=0, column=0, sticky="ew", padx=2)
+        self.mic_button = tk.Button(extras, text="Mic test", font=("sans", 9),
+                                    command=self.start_mic_test)
+        self.mic_button.grid(row=0, column=1, sticky="ew", padx=2)
+        self.contacts_window = None
+        self.sync_job: BackgroundJob | None = None
+        self.sync_by_hand = False   # Sync was pressed (so say how it went)
+        self.next_auto_sync = 0.0   # when to try the daily automatic copy again
+        self.mic_job: BackgroundJob | None = None
+
         tk.Button(self.root, text="Quit (stop watching for calls)", font=("sans", 8),
                   relief="flat", fg="#666666", command=self.root.destroy
-                  ).grid(row=12, column=0, columnspan=3, pady=(6, 0))
+                  ).grid(row=13, column=0, columnspan=3, pady=(6, 0))
 
         # The window's X button hides it; it keeps running to catch incoming calls.
         self.root.protocol("WM_DELETE_WINDOW", self.root.withdraw)
@@ -617,6 +857,200 @@ class PhoneWindow:
         self.entry.delete(0, self.tk.END)
         self.entry.insert(0, text[:-1])
 
+    # -- contacts --
+
+    def open_contacts(self) -> None:
+        """The Contacts window: search, call, copy from the phone, edit your own list."""
+        tk = self.tk
+        if self.contacts_window is not None:
+            self.contacts_window.deiconify()
+            self.contacts_window.lift()
+            return
+        top = tk.Toplevel(self.root)
+        top.title("Contacts")
+        top.configure(padx=10, pady=10)
+        self.contacts_window = top
+
+        def closed() -> None:
+            self.contacts_window = None
+            top.destroy()
+        top.protocol("WM_DELETE_WINDOW", closed)
+
+        tk.Label(top, text="Search (name or number):", font=("sans", 9)
+                 ).grid(row=0, column=0, columnspan=3, sticky="w")
+        search = tk.Entry(top, font=("sans", 12))
+        search.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(0, 6))
+        frame = tk.Frame(top)
+        frame.grid(row=2, column=0, columnspan=3, sticky="nsew")
+        listbox = tk.Listbox(frame, font=("sans", 11), width=42, height=16, activestyle="none")
+        scroll = tk.Scrollbar(frame, command=listbox.yview)
+        listbox.configure(yscrollcommand=scroll.set)
+        listbox.pack(side="left", fill="both", expand=True)
+        scroll.pack(side="right", fill="y")
+        top.columnconfigure(0, weight=1)
+        top.rowconfigure(2, weight=1)
+        info = tk.Label(top, text="", font=("sans", 9), fg="#666666", wraplength=360, justify="left")
+        info.grid(row=3, column=0, columnspan=3, sticky="w", pady=(6, 6))
+
+        shown: list[tuple[str, str, str]] = []
+
+        def fill(_event=None) -> None:
+            """Show the contacts that match the search box."""
+            words = search.get().strip().lower()
+            digits = re.sub(r"\D", "", words)
+            shown.clear()
+            listbox.delete(0, tk.END)
+            for name, label, number in sorted(all_contacts(), key=lambda c: c[0].lower()):
+                if words and words not in name.lower() and \
+                        not (digits and digits in re.sub(r"\D", "", number)):
+                    continue
+                shown.append((name, label, number))
+                listbox.insert(tk.END, f"{name}   {label + ' ' if label else ''}{number}")
+            total = len(all_contacts())
+            if os.path.exists(PHONE_BOOK_FILE):
+                import time
+                when = time.strftime("%d %b %Y, %H:%M", time.localtime(os.path.getmtime(PHONE_BOOK_FILE)))
+                copied = f"Copied from the phone {when} (again every day while it's connected)."
+            else:
+                copied = "Nothing copied from the phone yet: press Sync from phone."
+            info.configure(text=f"{len(shown)} of {total} contacts. {copied}\n"
+                                "Double-click a contact to call it.")
+            if shown:
+                listbox.selection_set(0)
+        top.refill = fill   # so a finished sync can update the list
+
+        def chosen() -> tuple[str, str, str] | None:
+            selection = listbox.curselection()
+            return shown[selection[0]] if selection else None
+
+        def call(_event=None) -> None:
+            contact = chosen()
+            if not contact:
+                return
+            if self.ringing:
+                self.show_note("Answer or hang up the ringing call first.")
+                return
+            number = contact[2]
+            if self.attempt(dial, number):
+                if not self.busy:
+                    self.entry.delete(0, tk.END)
+                    self.entry.insert(0, number)
+                closed()
+                self.show_window()
+            else:
+                info.configure(text=self.note.cget("text"))
+            self.refresh(reschedule=False)
+
+        def put_in_box() -> None:
+            contact = chosen()
+            if contact and not self.busy:
+                self.entry.delete(0, tk.END)
+                self.entry.insert(0, contact[2])
+                self.show_window()
+
+        def edit_own() -> None:
+            """Open your own contacts file in the text editor."""
+            if not os.path.exists(CONTACTS_FILE):
+                with open(CONTACTS_FILE, "w", encoding="utf-8") as handle:
+                    handle.write("# Your own contacts, one per line:  name = number\n"
+                                 "# Example:\n# mum = 0412 345 678\n")
+            subprocess.Popen(["xdg-open", CONTACTS_FILE], stdout=subprocess.DEVNULL,
+                             stderr=subprocess.DEVNULL)
+            info.configure(text="Your contacts file is open in the text editor: one line per "
+                                "contact, like  mum = 0412 345 678. Save it, then come back here.")
+            top.after(1000, watch_file)
+
+        def watch_file(last=[None]) -> None:   # noqa: B006 - remembers the file's time
+            """Show changes to your own file as soon as it is saved."""
+            if self.contacts_window is not top:
+                return
+            try:
+                mtime = os.path.getmtime(CONTACTS_FILE)
+            except OSError:
+                mtime = None
+            if last[0] is not None and mtime != last[0]:
+                fill()
+            last[0] = mtime
+            top.after(1000, watch_file)
+
+        search.bind("<KeyRelease>", fill)
+        search.bind("<Return>", call)
+        search.bind("<Down>", lambda _event: listbox.focus_set())
+        listbox.bind("<Double-Button-1>", call)
+        listbox.bind("<Return>", call)
+        top.bind("<Escape>", lambda _event: closed())
+
+        buttons = tk.Frame(top)
+        buttons.grid(row=4, column=0, columnspan=3, sticky="ew")
+        for column, (text, command) in enumerate((
+                ("Call", call), ("Put in number box", put_in_box),
+                ("Sync from phone", lambda: self.start_sync(by_hand=True)),
+                ("Edit my own list", edit_own))):
+            buttons.columnconfigure(column, weight=1, uniform="contact-buttons")
+            tk.Button(buttons, text=text, font=("sans", 9), command=command
+                      ).grid(row=0, column=column, sticky="ew", padx=2)
+        fill()
+        search.focus_set()
+
+    def start_sync(self, by_hand: bool = False) -> None:
+        """Copy the phone's contacts, in the background (it takes a few seconds)."""
+        if self.sync_job:
+            if by_hand:
+                self.sync_by_hand = True
+                self.show_note("Already copying the phone's contacts...", 30)
+            return
+        self.sync_by_hand = by_hand
+        self.sync_job = BackgroundJob("sync")
+        if by_hand:
+            self.show_note("Copying the phone's contacts... (the phone may ask you to allow it)", 60)
+            self.contacts_info("Copying the phone's contacts...")
+
+    def contacts_info(self, text: str) -> None:
+        """Say something at the bottom of the Contacts window, if it is open."""
+        if self.contacts_window is not None:
+            for child in self.contacts_window.grid_slaves(row=3):
+                child.configure(text=text)
+
+    def start_mic_test(self) -> None:
+        """Record for 8 seconds and show how loud you are (normal mic and clean mic)."""
+        if self.mic_job or self.busy:
+            return
+        self.mic_job = BackgroundJob("mictest")
+        self.mic_button.configure(state="disabled", text="Talk now...")
+        self.show_note("Mic test: talk normally for 8 seconds, as if you were on a call.", 10)
+
+    def check_jobs(self, phone: str) -> None:
+        """Once a second: has a background job finished? Is the daily contacts copy due?"""
+        import time
+        if self.sync_job and self.sync_job.finished():
+            worked, output = self.sync_job.result()
+            self.sync_job = None
+            if worked or self.sync_by_hand:
+                self.show_note(output, 10)
+            if self.contacts_window is not None:
+                if worked:
+                    self.contacts_window.refill()
+                else:
+                    self.contacts_info(output)
+        if self.mic_job and self.mic_job.finished():
+            _worked, output = self.mic_job.result()
+            self.mic_job = None
+            self.mic_button.configure(text="Mic test")
+            self.show_note("")
+            from tkinter import messagebox
+            messagebox.showinfo("Mic test", output, parent=self.root)
+        if not self.mic_job:
+            self.mic_button.configure(state="disabled" if self.busy else "normal")
+        # The daily copy of the phone's contacts, when the phone is connected and idle.
+        if phone and not self.busy and not self.sync_job and time.monotonic() >= self.next_auto_sync:
+            try:
+                age = time.time() - os.path.getmtime(PHONE_BOOK_FILE)
+            except OSError:
+                age = SYNC_EVERY
+            if age >= SYNC_EVERY:
+                self.next_auto_sync = time.monotonic() + 3600   # if it fails, try again in an hour
+                self.start_sync()
+
     # -- keeping the window in step with the phone --
 
     def refresh(self, reschedule: bool = True) -> None:
@@ -723,6 +1157,7 @@ class PhoneWindow:
         self.hangup_button.configure(state="normal" if self.busy else "disabled")
 
         if reschedule:
+            self.check_jobs(phone)
             if self.note_ticks > 0:
                 self.note_ticks -= 1
                 if self.note_ticks == 0:
@@ -925,6 +1360,17 @@ def main() -> None:
             return
         PhoneWindow(bus, number, hidden=(command == "watch"),
                     listener=start_listening()).run()
+        return
+    if command == "sync":
+        # Only printed (no pop-up): the window runs this every day and shows the result itself.
+        try:
+            print(f"Copied {sync_contacts(bus)} contacts from the phone.")
+        except PhoneError as error:
+            print(error)
+            sys.exit(1)
+        except dbus.DBusException as error:
+            print(f"Could not copy the contacts: {error.get_dbus_message() or error}")
+            sys.exit(1)
         return
     try:
         if command == "dial":

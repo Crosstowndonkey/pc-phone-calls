@@ -4,6 +4,7 @@ rm -f ~/.local/bin/phone
 rm -f ~/.local/share/applications/phone-dial.desktop
 rm -f ~/.config/autostart/phone-watch.desktop
 rm -f ~/.config/phone-settings.json
+rm -f ~/.config/phone-contacts-from-phone.json   # the copy of the phone's contacts
 if [ -f ~/.config/pipewire/filter-chain.conf.d/phone-clean-mic.conf ]; then
     rm -f ~/.config/pipewire/filter-chain.conf.d/phone-clean-mic.conf
     # Stop the filter service if the clean mic was the only thing using it.

@@ -14,7 +14,11 @@ hands-free standard and should work the same way, but that is untested.
 - **Stays open during the call**, with a timer and who you're talking to.
 - **Key tones** for "press 1 for accounts" phone menus.
 - **Incoming calls** pop the window up, showing the caller's number, or their
-  name if they're in your contacts file.
+  name if they're in your contacts.
+- **Your phone's contacts** (optional): copied from the phone over Bluetooth,
+  searchable in a Contacts window; double-click one to call. Your own extra
+  list can be added from the same window.
+- **Mic test** button: shows how loud your voice is.
 - **Hold, swap and conference calls:** put a call on hold, add a second call,
   switch between two, or join them together.
 - **Call volume** slider.
@@ -164,6 +168,7 @@ Right-clicking the app menu launcher also offers "Answer call" and "Hang up".
 | `phone merge` | Joins both calls into a conference call |
 | `phone tones 1` | Presses keys during a call |
 | `phone clean on` / `off` | Turns noise removal for your voice on or off |
+| `phone sync` | Copies the phone's contacts to the PC |
 | `phone mictest` | Talk for 8 seconds; shows how loud you are on the normal mic and the clean mic |
 | `phone watch` | Starts hidden and waits for calls |
 | `phone status` | Shows the connected phone and any calls |
@@ -172,14 +177,29 @@ Right-clicking the app menu launcher also offers "Answer call" and "Hang up".
 
 - **Web pages:** clicking a phone-number link opens the Phone window with the
   number filled in. Nothing dials until you press Call.
-- **Contacts:** add lines like `mum = 0412 345 678` to
-  `~/.config/phone-contacts.txt`, then type "mum" instead of the number.
+- **Contacts:** press **Contacts** in the Phone window. Type to search by
+  name or number; double-click a contact (or select it and press Call) to
+  ring it. You can also type a contact's name in the number box.
+  - **Your phone's contacts:** install `bluez-obex` once
+    (`sudo pacman -S bluez-obex`), then press **Sync from phone**. On an
+    iPhone, first turn on Settings > Bluetooth > (i) next to the PC >
+    **Sync Contacts** (Android: allow contact sharing when the phone asks).
+    After that the copy is refreshed by itself once a day while the phone is
+    connected. It's a one-way copy: nothing on the phone is changed.
+  - **Your own list:** **Edit my own list** opens
+    `~/.config/phone-contacts.txt` in the text editor; add lines like
+    `mum = 0412 345 678`. If a name is in both, your list wins.
+- **Mic test:** press **Mic test** and talk for 8 seconds; it shows how loud
+  you are on the normal microphone and the clean mic.
 - **Calls started on the phone itself:** on the call screen tap the Bluetooth
   button (Samsung) or the audio button (iPhone) and pick the PC.
 
 ## If something is off
 
 - **"No phone connected":** the phone isn't connected over Bluetooth.
+- **Sync from phone says the phone would not share its contacts:** on an
+  iPhone turn on Sync Contacts (Settings > Bluetooth > (i) next to the PC),
+  then press Sync from phone again.
 - **No sound in a call:** while the call is up, open the volume widget in the
   tray. The phone shows as an extra playback and recording stream; point them
   at your headset and your microphone.
@@ -201,7 +221,7 @@ Right-clicking the app menu launcher also offers "Answer call" and "Hang up".
 ./uninstall.sh
 ```
 
-Your contacts file is kept.
+Your own contacts file is kept; the copy of the phone's contacts is removed.
 
 ## What it installs
 
@@ -213,7 +233,8 @@ Everything goes inside your home folder:
 | `~/.local/share/applications/phone-dial.desktop` | The app menu entry |
 | `~/.config/autostart/phone-watch.desktop` | Starts Phone hidden at login |
 | `~/.config/wireplumber/wireplumber.conf.d/50-phone-calls.conf` | Turns on hands-free mode |
-| `~/.config/phone-contacts.txt` | Your contacts (optional) |
+| `~/.config/phone-contacts.txt` | Your own contacts (optional) |
+| `~/.config/phone-contacts-from-phone.json` | The copy of the phone's contacts (made by Sync) |
 | `~/.config/phone-settings.json` | The window's tick boxes (made when you first change one) |
 | `~/.config/pipewire/filter-chain.conf.d/phone-clean-mic.conf` | The noise-removing microphone (only with the RNNoise plugin) |
 
